@@ -128,6 +128,13 @@ def ocr_page_full(page: fitz.Page) -> tuple[str, float, np.ndarray]:
     return best_text, best_conf, best_img
 
 
+def ocr_page_highres(page: fitz.Page) -> tuple[str, float, np.ndarray]:
+    """One 400dpi sparse-text pass — rescue for stamp words on note pages."""
+    img = render_page(page, dpi=400)
+    text, conf = _ocr(img, 11)
+    return text, conf, img
+
+
 ID_WORD = None  # lazy-compiled regex
 
 

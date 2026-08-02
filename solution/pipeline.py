@@ -34,6 +34,15 @@ def gather_pages(pdf_path: str) -> list[pagedoc.PageDoc]:
                     if ids:
                         pd.fields["sponsor_id"] = ids[0]
                         break
+            # Note-stamp rescue: an adjudicator note whose finding didn't
+            # parse gets one high-DPI sparse-text retry — notes are the top
+            # trusted evidence and worth the extra pass.
+            if pd.ptype == "note" and not pd.findings:
+                text2, _, _ = ocr.ocr_page_highres(page)
+                pd2 = pagedoc.parse_page(i, text2 + "\n" + footer, "ocr", ocr_conf=conf)
+                if pd2.findings:
+                    pd.findings = pd2.findings
+                    pd.observed_flags |= pd2.observed_flags
         pages.append(pd)
     doc.close()
     return pages
@@ -129,6 +138,11 @@ def merge_case(pages: list[pagedoc.PageDoc]) -> dict:
                 merged[key] = val
                 provenance[key] = (p.ptype, p.source, p.ocr_conf)
 
+    # Last resort: context-free value scavenging. The vocabularies are
+    # distinctive enough (ALL_CAPS species codes, unique world names, visa
+    # patterns) to recover values from garbled pages where labels died.
+    _scavenge(pages, merged, provenance, case_id)
+
     # Fee inference from the receipt's Amount when the status word is
     # unreadable: $809 = paid; $0 with a waiver code = waived (validated
     # 297/297 and 106/106 on text-layer train receipts).
@@ -169,7 +183,7 @@ def merge_case(pages: list[pagedoc.PageDoc]) -> dict:
         if p.decoy or p.ptype != "biometric" or p.source != "ocr":
             continue
         obs_line = bool(p.observed_flags) or "observed" in p.text.lower()
-        if (p.ocr_conf or 0) < 65 and not obs_line:
+        if (p.ocr_conf or 0) < 55 and not obs_line:
             flags.add("illegible_biometrics")
 
     _resolve_name(pages, merged, provenance, flags, case_id)
@@ -179,6 +193,87 @@ def merge_case(pages: list[pagedoc.PageDoc]) -> dict:
     merged["_provenance"] = provenance
     merged["_pages"] = pages
     return merged
+
+
+def _scavenge(pages, merged, provenance, case_id):
+    from rapidfuzz import fuzz, process as rf_process
+
+    from solution import vocab
+
+    texts = []
+    for p in pages:
+        if p.decoy or (case_id and p.packet_id and p.packet_id != case_id):
+            continue
+        texts.append(p.text)
+    blob = "\n".join(texts)
+
+    if not merged.get("species_code"):
+        toks = re.findall(r"[A-Z][A-Z_ ]{5,24}", blob.upper())
+        best = (None, 0)
+        for t in toks:
+            r = rf_process.extractOne(t.strip().replace(" ", "_"), vocab.SPECIES_CODES, scorer=fuzz.ratio)
+            if r and r[1] > best[1]:
+                best = (r[0], r[1])
+        if best[1] >= 75:
+            merged["species_code"] = best[0]
+            provenance["species_code"] = ("scavenge", "ocr", None)
+
+    if not merged.get("home_world"):
+        best = (None, 0)
+        for line in blob.splitlines():
+            line = line.strip()
+            if not (3 <= len(line) <= 60):
+                continue
+            for w in vocab.HOME_WORLDS:
+                s = fuzz.partial_ratio(w.lower(), line.lower())
+                if s > best[1] and len(line) >= len(w) - 2:
+                    best = (w, s)
+        if best[1] >= 85:
+            merged["home_world"] = best[0]
+            provenance["home_world"] = ("scavenge", "ocr", None)
+
+    if not merged.get("visa_class"):
+        m = re.search(r"\b(XW|DIP|MED|TRANSIT)\s*[-–—]?\s*([1237])\b", blob, re.I)
+        if m:
+            merged["visa_class"] = extract.snap_visa(f"{m.group(1)}-{m.group(2)}")
+            provenance["visa_class"] = ("scavenge", "ocr", None)
+
+    if not merged.get("declared_purpose"):
+        best = (None, 0)
+        for line in blob.splitlines():
+            line = line.strip().lower()
+            if not (4 <= len(line) <= 50):
+                continue
+            for pu in vocab.DECLARED_PURPOSES:
+                s = fuzz.partial_ratio(pu, line)
+                if s > best[1]:
+                    best = (pu, s)
+        if best[1] >= 88:
+            merged["declared_purpose"] = best[0]
+            provenance["declared_purpose"] = ("scavenge", "ocr", None)
+
+    if not merged.get("sponsor_id"):
+        ids = extract.find_sponsor_ids(blob)
+        if ids:
+            merged["sponsor_id"] = max(set(ids), key=ids.count)
+            provenance["sponsor_id"] = ("scavenge", "ocr", None)
+
+    if not merged.get("arrival_date"):
+        dates = re.findall(r"20\d{2}-\d{2}-\d{2}", blob)
+        if dates:
+            merged["arrival_date"] = max(set(dates), key=dates.count)
+            provenance["arrival_date"] = ("scavenge", "ocr", None)
+
+    if not merged.get("applicant_name"):
+        toks = re.findall(r"[A-Z][a-z]{3,10}", blob)
+        good = []
+        for t in toks:
+            r = rf_process.extractOne(t, vocab.NAME_TOKENS, scorer=fuzz.ratio)
+            if r and r[1] >= 84:
+                good.append(r[0])
+        if len(good) >= 2:
+            merged["applicant_name"] = f"{good[0]} {good[1]}"
+            provenance["applicant_name"] = ("scavenge", "ocr", None)
 
 
 # When pages disagree on the applicant, the intake form is the tampered one:
@@ -203,7 +298,7 @@ def _resolve_name(pages, merged, provenance, flags, case_id):
         name = extract.snap_name(raw)
         if not name or " " not in name:
             continue
-        trusted = p.source == "text" or (p.ocr_conf or 0) >= 55
+        trusted = p.source == "text" or (p.ocr_conf or 0) >= 80
         candidates.append((name, p.ptype, trusted))
 
     if candidates and not corrected:
@@ -233,7 +328,7 @@ def _resolve_name(pages, merged, provenance, flags, case_id):
         for p in pages:
             if p.decoy or p.ptype != "sponsor":
                 continue
-            if p.source == "ocr" and (p.ocr_conf or 0) < 55:
+            if p.source == "ocr" and (p.ocr_conf or 0) < 75:
                 continue
             ln = extract.snap_name(p.fields.get("applicant_name", ""))
             if ln and " " in ln and ln != final:
@@ -276,6 +371,7 @@ def decide(merged: dict) -> tuple[str, dict]:
     signals["low_conf_pages"] = len(low_conf)
     decision, rule = adjudicate(fields)
     signals["rule"] = rule
+    signals["engine_decision"] = decision  # pre-policy, for calibration fits
 
     # Per-rule decision-policy overrides fit on train (expected-points argmax
     # over each rule's truth distribution); see tools/fit_calibration.py.
@@ -298,13 +394,15 @@ def case_features(merged: dict, decision: str, signals: dict) -> dict:
     )
     return {
         "rule": signals.get("rule", "?"),
-        "decision": decision,
+        "decision": signals.get("engine_decision", decision),
         "n_pages": len(pages),
         "n_ocr": len(ocr_confs),
         "min_ocr_conf": round(min(ocr_confs), 1) if ocr_confs else None,
         "missing_fields": missing,
         "has_b13": any(p.ptype == "biometric" for p in pages),
         "has_note": any(p.findings for p in pages),
+        "has_fee_page": any(p.ptype == "fee" for p in pages),
+        "fee_source": (merged.get("_provenance", {}).get("fee_status") or ("missing",))[0],
         "flags": "|".join(sorted(merged["risk_flags"])) or "none",
     }
 

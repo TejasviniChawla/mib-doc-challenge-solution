@@ -143,7 +143,12 @@ def classify(text: str) -> str:
     return "unknown"
 
 
+BLANK_MARKERS = re.compile(r"CUT\s*OUT|REGISTRY\s*LOST|REDACTED|BLANK|WASHED\s*OUT|TORN", re.I)
+
+
 def _clean_value(val: str) -> str:
+    if BLANK_MARKERS.search(val):
+        return ""  # damaged-evidence marker, not a value
     for w in STAMP_WORDS:
         idx = val.upper().find(w.upper())
         if idx >= 0:
@@ -253,5 +258,10 @@ def parse_page(index: int, text: str, source: str, ocr_conf: float | None = None
             f = extract.snap_flag(m.group(1))
             if f:
                 pd.observed_flags.add(f)
+        # "Prior denial stamp rescinded. Route to human review."
+        for line in text.splitlines():
+            if len(line) < 90 and fuzz.partial_ratio("rescinded", line.lower()) >= 80:
+                pd.observed_flags.add("rescinded_denial")
+                break
 
     return pd
