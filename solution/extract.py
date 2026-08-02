@@ -34,10 +34,15 @@ def _fix_id_digits(text: str) -> str:
 
 
 def normalize_date(text: str) -> str | None:
-    m = DATE_ISO_RE.search(text)
-    if m:
-        y, mo, d = m.groups()
-        return f"{y}-{int(mo):02d}-{int(d):02d}"
+    from datetime import date as _date
+
+    for m in DATE_ISO_RE.finditer(text):
+        y, mo, d = (int(x) for x in m.groups())
+        try:
+            _date(y, mo, d)
+        except ValueError:
+            continue  # OCR digit misread produced an impossible date
+        return f"{y}-{mo:02d}-{d:02d}"
     return None
 
 
