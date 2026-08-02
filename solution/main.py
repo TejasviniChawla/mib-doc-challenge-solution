@@ -37,12 +37,20 @@ def main() -> int:
         results = [process_pdf(p) for p in pdfs]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    features_path = os.environ.get("MIB_FEATURES_PATH")
+    ff = open(features_path, "w") if features_path else None
     written = 0
     with open(output_path, "w") as f:
         for record in results:
-            if record is not None:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                written += 1
+            if record is None:
+                continue
+            feats = record.pop("_features", None)
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if ff is not None and feats is not None:
+                ff.write(json.dumps({"case_id": record["case_id"], **feats}) + "\n")
+            written += 1
+    if ff is not None:
+        ff.close()
     sys.stderr.write(f"[info] wrote {written}/{len(pdfs)} predictions to {output_path}\n")
     return 0
 

@@ -128,6 +128,25 @@ def merge_case(pages: list[pagedoc.PageDoc]) -> dict:
                 merged[key] = val
                 provenance[key] = (p.ptype, p.source, p.ocr_conf)
 
+    # Fee inference from the receipt's Amount when the status word is
+    # unreadable: $809 = paid; $0 with a waiver code = waived (validated
+    # 297/297 and 106/106 on text-layer train receipts).
+    if not merged.get("fee_status"):
+        for p in pages:
+            if p.decoy or p.ptype not in ("fee", "unknown"):
+                continue
+            amount = p.fields.get("amount", "")
+            digits = re.sub(r"[^\d]", "", amount.split(".")[0]) if amount else ""
+            if digits.endswith("809") or digits == "809":
+                merged["fee_status"] = "paid"
+                provenance["fee_status"] = ("amount", p.source, p.ocr_conf)
+                break
+            waiver = p.fields.get("waiver_code", "")
+            if digits in ("0", "000") and waiver and waiver.upper() not in ("N/A", "NA"):
+                merged["fee_status"] = "waived"
+                provenance["fee_status"] = ("amount", p.source, p.ocr_conf)
+                break
+
     # Manual corrections override everything (rank-1 evidence).
     for p in pages:
         for key, raw in p.corrections.items():
@@ -167,6 +186,7 @@ def decide(merged: dict) -> tuple[str, dict]:
         decision = findings[-1][1]
         signals["note"] = True
         signals["note_source"] = findings[-1][3]
+        signals["rule"] = "note_" + findings[-1][3]
         return decision, signals
 
     ocr_pages = [p for p in pages if p.source == "ocr"]
@@ -183,20 +203,52 @@ def decide(merged: dict) -> tuple[str, dict]:
         ),
     }
     signals["low_conf_pages"] = len(low_conf)
-    return adjudicate(fields), signals
+    decision, rule = adjudicate(fields)
+    signals["rule"] = rule
+    return decision, signals
 
 
-def confidence_for(merged: dict, decision: str, signals: dict) -> float:
-    """Heuristic confidence v1; replaced by trained calibrator later."""
-    if signals.get("note") and signals.get("note_source") == "text":
+def case_features(merged: dict, decision: str, signals: dict) -> dict:
+    """Features for confidence calibration, bucketed offline against train."""
+    pages = merged["_pages"]
+    ocr_confs = [p.ocr_conf for p in pages if p.source == "ocr" and p.ocr_conf is not None]
+    missing = sum(
+        1 for k in ("visa_class", "fee_status", "sponsor_id", "arrival_date", "applicant_name")
+        if not merged.get(k)
+    )
+    return {
+        "rule": signals.get("rule", "?"),
+        "decision": decision,
+        "n_pages": len(pages),
+        "n_ocr": len(ocr_confs),
+        "min_ocr_conf": round(min(ocr_confs), 1) if ocr_confs else None,
+        "missing_fields": missing,
+        "has_b13": any(p.ptype == "biometric" for p in pages),
+        "has_note": any(p.findings for p in pages),
+        "flags": "|".join(sorted(merged["risk_flags"])) or "none",
+    }
+
+
+def confidence_for(features: dict) -> float:
+    """Calibrated confidence: empirical accuracy per bucket, fit on train
+    (see tools/fit_calibration.py, which writes solution/calib.py)."""
+    try:
+        from solution.calib import lookup
+
+        c = lookup(features)
+        if c is not None:
+            return c
+    except ImportError:
+        pass
+    # Fallback heuristic when no calibration table is present.
+    rule = features.get("rule", "")
+    if rule.startswith("note_text"):
         return 0.98
-    if signals.get("note"):
+    if rule.startswith("note_"):
         return 0.9
-    conf = 0.85
-    if signals.get("low_conf_pages"):
-        conf -= 0.15
-    missing = sum(1 for k in ("visa_class", "fee_status", "sponsor_id", "arrival_date") if not merged.get(k))
-    conf -= 0.08 * missing
+    conf = 0.85 - 0.08 * features.get("missing_fields", 0)
+    if (features.get("min_ocr_conf") or 100) < 45:
+        conf -= 0.1
     return round(max(0.3, min(conf, 0.97)), 2)
 
 
@@ -213,9 +265,11 @@ def run_case(pdf_path: str) -> dict | None:
         return None
 
     decision, signals = decide(merged)
-    conf = confidence_for(merged, decision, signals)
+    features = case_features(merged, decision, signals)
+    conf = confidence_for(features)
 
     return {
+        "_features": features,
         "case_id": case_id,
         "applicant_name": merged.get("applicant_name") or "",
         "species_code": merged.get("species_code") or "",

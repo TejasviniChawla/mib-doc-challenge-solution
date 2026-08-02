@@ -48,7 +48,45 @@ L = {
     "waiver_code": _label(r"\bWa[il]ver\s*Code\b"),
     "registry_status": _label(r"\bRegistry\s*Status\b"),
     "biometric_confidence": _label(r"\bBiometric\s*confidence\b"),
+    "amount": _label(r"\bAmount\b"),
 }
+
+# Reference label phrases for fuzzy per-line recovery on OCR pages where the
+# strict regexes miss (labels themselves get OCR-damaged).
+FUZZY_LABELS = {
+    "case_id": ["case id"],
+    "applicant_name": ["applicant", "registry name"],
+    "species_code": ["species code", "species match"],
+    "home_world": ["home world"],
+    "visa_class": ["visa class"],
+    "sponsor_id": ["sponsor id"],
+    "arrival_date": ["arrival date"],
+    "declared_purpose": ["declared purpose"],
+    "fee_status": ["fee status"],
+    "waiver_code": ["waiver code"],
+    "amount": ["amount"],
+}
+
+
+def _fuzzy_line_fields(text: str) -> dict:
+    """Recover 'Label: value' lines whose labels were OCR-damaged."""
+    out: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if ":" not in line or len(line) > 90:
+            continue
+        lab, val = line.split(":", 1)
+        lab = lab.strip().lower()
+        val = val.strip()
+        if not val or len(lab) > 24:
+            continue
+        for key, refs in FUZZY_LABELS.items():
+            if key in out:
+                continue
+            if any(fuzz.ratio(lab, ref) >= 70 for ref in refs):
+                out[key] = val
+                break
+    return out
 
 # Fuzzy page-header cues: (page type, reference phrase, threshold).
 HEADER_CUES = [
@@ -157,6 +195,13 @@ def parse_page(index: int, text: str, source: str, ocr_conf: float | None = None
             if val and not val.startswith("["):
                 pd.fields[key] = val
 
+    if source == "ocr":
+        for key, val in _fuzzy_line_fields(text).items():
+            if key not in pd.fields:
+                val = _clean_value(val)
+                if val and not val.startswith("["):
+                    pd.fields[key] = val
+
     for who, val in CORRECTION_RE.findall(text):
         key = {
             "applicant": "applicant_name",
@@ -174,6 +219,18 @@ def parse_page(index: int, text: str, source: str, ocr_conf: float | None = None
             f = extract.snap_flag(tok)
             if f:
                 pd.observed_flags.add(f)
+    if source == "ocr" and not pd.observed_flags:
+        # Fuzzy per-line recovery of a damaged "Observed flags:" label.
+        for line in text.splitlines():
+            line = line.strip()
+            if len(line) > 80 or ":" not in line:
+                continue
+            lab, val = line.split(":", 1)
+            if fuzz.ratio(lab.strip().lower(), "observed flags") >= 65:
+                for tok in re.split(r"[|,\s]+", val):
+                    f = extract.snap_flag(tok)
+                    if f:
+                        pd.observed_flags.add(f)
 
     if ptype == "sponsor":
         m = SPONSOR_ATTEST_RE.search(text)

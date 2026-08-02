@@ -56,8 +56,11 @@ def is_stale(arrival_date: str | None, receipt_date: str | None) -> bool | None:
     return arrival < date(2026, 1, 28)
 
 
-def adjudicate(fields: dict) -> str:
+def adjudicate(fields: dict) -> tuple[str, str]:
     """Decide APPROVED / DENIED / NEEDS_REVIEW from extracted fields.
+
+    Returns (decision, rule_name) — the rule name feeds confidence
+    calibration.
 
     `fields` keys: visa_class, fee_status, sponsor_id, home_world,
     arrival_date, risk_flags (set), receipt_date (optional),
@@ -73,31 +76,31 @@ def adjudicate(fields: dict) -> str:
 
     # Hard denials — trusted disqualifying evidence beats everything else.
     if flags & DISQUALIFYING_FLAGS:
-        return "DENIED"
+        return "DENIED", "disq_flag"
     if home in EMBARGO_FULL:
-        return "DENIED"
+        return "DENIED", "embargo_world"
     if visa == "TRANSIT-7":
-        return "DENIED"
+        return "DENIED", "transit"
     if fee == "unpaid" and not (fields.get("fee_waiver_visible") and not dip):
-        return "DENIED"
+        return "DENIED", "unpaid"
     if home in EMBARGO_NON_DIP and not dip:
-        return "DENIED"
+        return "DENIED", "wolf_embargo"
     if sponsor in REVOKED_SPONSORS and not dip:
-        return "DENIED"
+        return "DENIED", "revoked_sponsor"
     stale = is_stale(fields.get("arrival_date"), fields.get("receipt_date"))
     if stale and not dip:
-        return "DENIED"
+        return "DENIED", "stale_date"
 
     # Review conditions.
     if fee == "unknown" or not fee:
-        return "NEEDS_REVIEW"
+        return "NEEDS_REVIEW", "fee_unknown"
     if flags & REVIEW_FLAGS:
-        return "NEEDS_REVIEW"
+        return "NEEDS_REVIEW", "review_flag"
     if fields.get("evidence_problem"):
-        return "NEEDS_REVIEW"
+        return "NEEDS_REVIEW", "evidence_problem"
     if not fields.get("arrival_date"):
-        return "NEEDS_REVIEW"  # manual: missing/hidden-only arrival date
+        return "NEEDS_REVIEW", "no_arrival"
     if not sponsor and not dip:
-        return "NEEDS_REVIEW"  # sponsor required unless DIP-1
+        return "NEEDS_REVIEW", "no_sponsor"
 
-    return "APPROVED"
+    return "APPROVED", "clean"
