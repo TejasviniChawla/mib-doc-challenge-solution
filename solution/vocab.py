@@ -69,3 +69,9 @@ ALL_RISK_FLAGS = sorted(DISQUALIFYING_FLAGS | REVIEW_FLAGS)
 REVOKED_SPONSORS = {"SPN-0007", "SPN-0139", "SPN-4040"}
 
 ADJUDICATIONS = ["APPROVED", "DENIED", "NEEDS_REVIEW"]
+
+# Applicant names are always two tokens drawn from a closed 12x12
+# prefix-suffix generator (144 tokens, verified exhaustive on train).
+NAME_PREFIXES = ["Ari", "Ixo", "Lu", "Mira", "Nex", "Ori", "Qor", "Sol", "Tek", "Vee", "Xan", "Za"]
+NAME_SUFFIXES = ["dane", "ix", "kesh", "mora", "nax", "quell", "rix", "tari", "ul", "vara", "voss", "zarn"]
+NAME_TOKENS = [p + s for p in NAME_PREFIXES for s in NAME_SUFFIXES]

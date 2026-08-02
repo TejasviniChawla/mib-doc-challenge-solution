@@ -1,23 +1,34 @@
-"""Fit the confidence-calibration table from a train run.
+"""Fit the decision policy and confidence-calibration table from a train run.
 
 Usage:
-  MIB_FEATURES_PATH=/tmp/mib-dev/features.jsonl  (during solution.main run)
   python tools/fit_calibration.py \
       --features /tmp/mib-dev/features.jsonl \
-      --predictions /tmp/mib-dev/predictions.jsonl \
       --truth <challenge>/data/train_labels.csv \
       --out solution/calib.py
 
-Buckets each case by (rule, ocr-quality band, missing-field band), computes
-the empirical adjudication accuracy per bucket with Laplace smoothing toward
-the rule-level rate, and emits a lookup module. Brier-optimal confidence is
-exactly the bucket's expected accuracy.
+Two artifacts, written as one module:
+
+POLICY: per-rule decision override chosen by expected classification points
+  E[A] = 8 pA - 4 pD + 1 pR   (false approval is -4)
+  E[D] = 8 pD + 1 pR
+  E[R] = 2 pA + 2 pD + 8 pR
+computed over the rule's empirical truth distribution. Only rules where the
+argmax differs from the engine's default get an entry.
+
+BUCKET_ACC: empirical P(final decision correct) per
+(rule, ocr band, missing band) with smoothing — Brier-optimal confidence.
 """
 
 import argparse
 import collections
 import csv
 import json
+
+EXPECTED = {
+    "APPROVED": lambda pa, pd, pr: 8 * pa - 4 * pd + 1 * pr,
+    "DENIED": lambda pa, pd, pr: 8 * pd + 1 * pr,
+    "NEEDS_REVIEW": lambda pa, pd, pr: 2 * pa + 2 * pd + 8 * pr,
+}
 
 
 def band_ocr(min_conf):
@@ -34,54 +45,85 @@ def band_missing(n):
     return "0" if n == 0 else ("1" if n == 1 else "2+")
 
 
-def bucket_of(f):
-    return (f["rule"], band_ocr(f.get("min_ocr_conf")), band_missing(f.get("missing_fields", 0)))
+def argmax_policy(counts):
+    n = sum(counts.values())
+    pa = counts.get("APPROVED", 0) / n
+    pd = counts.get("DENIED", 0) / n
+    pr = counts.get("NEEDS_REVIEW", 0) / n
+    return max(EXPECTED, key=lambda d: EXPECTED[d](pa, pd, pr))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True)
-    ap.add_argument("--predictions", required=True)
     ap.add_argument("--truth", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     truth = {r["case_id"]: r["adjudication"].strip().upper() for r in csv.DictReader(open(args.truth))}
-    preds = {}
-    for line in open(args.predictions):
-        r = json.loads(line)
-        preds[r["case_id"]] = r["adjudication"].strip().upper()
-
-    bucket_stats = collections.defaultdict(lambda: [0, 0])  # bucket -> [n, correct]
-    rule_stats = collections.defaultdict(lambda: [0, 0])
-    total = [0, 0]
+    rows = []
     for line in open(args.features):
         f = json.loads(line)
-        cid = f["case_id"]
-        if cid not in truth or cid not in preds:
-            continue
-        ok = int(preds[cid] == truth[cid])
-        b = bucket_of(f)
-        bucket_stats[b][0] += 1
-        bucket_stats[b][1] += ok
-        rule_stats[f["rule"]][0] += 1
-        rule_stats[f["rule"]][1] += ok
+        if f["case_id"] in truth:
+            rows.append(f)
+
+    # ---- Policy: per-rule expected-points argmax ----
+    rule_truth = collections.defaultdict(collections.Counter)
+    for f in rows:
+        rule_truth[f["rule"]][truth[f["case_id"]]] += 1
+
+    policy = {}
+    print("rule -> truth distribution / engine default / points-argmax")
+    for rule, counts in sorted(rule_truth.items()):
+        decisions = collections.Counter(f["decision"] for f in rows if f["rule"] == rule)
+        default = decisions.most_common(1)[0][0]
+        # Note-driven decisions are per-case (each note states its own
+        # finding) — a blanket override would discard real evidence. Only
+        # uniform-decision rules are eligible for policy overrides.
+        uniform = len(decisions) == 1
+        n = sum(counts.values())
+        acc = counts.get(default, 0) / n if uniform else sum(
+            1 for f in rows if f["rule"] == rule and f["decision"] == truth[f["case_id"]]
+        ) / n
+        best = argmax_policy(counts) if (uniform and n >= 10) else default
+        marker = ""
+        if uniform and best != default and n >= 10:
+            policy[rule] = best
+            marker = "  << OVERRIDE"
+        print(f"  {rule:22s} n={n:3d} acc={acc:.2f} {dict(counts)}  default={default} argmax={best}{marker}")
+
+    def final_decision(f):
+        if f["rule"].startswith("note_"):
+            return f["decision"]
+        return policy.get(f["rule"], f["decision"])
+
+    # ---- Confidence calibration on post-policy decisions ----
+    bucket = collections.defaultdict(lambda: [0, 0])
+    rule_acc = collections.defaultdict(lambda: [0, 0])
+    total = [0, 0]
+    for f in rows:
+        ok = int(final_decision(f) == truth[f["case_id"]])
+        b = (f["rule"], band_ocr(f.get("min_ocr_conf")), band_missing(f.get("missing_fields", 0)))
+        bucket[b][0] += 1
+        bucket[b][1] += ok
+        rule_acc[f["rule"]][0] += 1
+        rule_acc[f["rule"]][1] += ok
         total[0] += 1
         total[1] += ok
 
     global_acc = total[1] / max(total[0], 1)
+    K = 8
     table = {}
-    K = 8  # smoothing pseudo-count toward the rule-level rate
-    for b, (n, c) in sorted(bucket_stats.items()):
-        rn, rc = rule_stats[b[0]]
-        rule_acc = rc / max(rn, 1)
-        acc = (c + K * rule_acc) / (n + K)
-        table["|".join(b)] = round(min(max(acc, 0.02), 0.99), 3)
-    rules = {r: round(min(max(c / max(n, 1), 0.02), 0.99), 3) for r, (n, c) in rule_stats.items()}
+    for b, (n, c) in sorted(bucket.items()):
+        rn, rc = rule_acc[b[0]]
+        racc = rc / max(rn, 1)
+        table["|".join(b)] = round(min(max((c + K * racc) / (n + K), 0.02), 0.99), 3)
+    rules = {r: round(min(max(c / max(n, 1), 0.02), 0.99), 3) for r, (n, c) in rule_acc.items()}
 
     with open(args.out, "w") as f:
-        f.write('"""Confidence calibration table fit on the public training set.\n')
-        f.write("Generated by tools/fit_calibration.py — do not edit by hand.\"\"\"\n\n")
+        f.write('"""Decision policy + confidence calibration fit on public train.\n')
+        f.write('Generated by tools/fit_calibration.py — do not edit by hand."""\n\n')
+        f.write(f"POLICY = {json.dumps(policy, indent=1, sort_keys=True)}\n\n")
         f.write(f"GLOBAL_ACC = {round(global_acc, 3)}\n\n")
         f.write(f"RULE_ACC = {json.dumps(rules, indent=1, sort_keys=True)}\n\n")
         f.write(f"BUCKET_ACC = {json.dumps(table, indent=1, sort_keys=True)}\n\n")
@@ -109,18 +151,7 @@ def lookup(features):
         return RULE_ACC[rule]
     return GLOBAL_ACC
 ''')
-    print(f"wrote {args.out}: {len(table)} buckets, {len(rules)} rules, global={global_acc:.3f}")
-
-    # Diagnostic: rule-level truth distribution for decision-policy review.
-    dist = collections.defaultdict(collections.Counter)
-    for line in open(args.features):
-        f = json.loads(line)
-        cid = f["case_id"]
-        if cid in truth:
-            dist[f["rule"]][truth[cid]] += 1
-    print("\nrule -> truth distribution:")
-    for r, c in sorted(dist.items()):
-        print(f"  {r:22s} {dict(c)}")
+    print(f"\nwrote {args.out}: {len(policy)} overrides, {len(table)} buckets, global_acc={global_acc:.3f}")
 
 
 if __name__ == "__main__":

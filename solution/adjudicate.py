@@ -92,8 +92,10 @@ def adjudicate(fields: dict) -> tuple[str, str]:
         return "DENIED", "stale_date"
 
     # Review conditions.
-    if fee == "unknown" or not fee:
-        return "NEEDS_REVIEW", "fee_unknown"
+    if fee == "unknown":
+        return "NEEDS_REVIEW", "fee_unknown"  # receipt literally says unknown
+    if not fee:
+        return "NEEDS_REVIEW", "fee_missing"  # receipt absent or unreadable
     if flags & REVIEW_FLAGS:
         return "NEEDS_REVIEW", "review_flag"
     if fields.get("evidence_problem"):

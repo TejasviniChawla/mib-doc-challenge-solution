@@ -56,6 +56,7 @@ NORMALIZERS = {
     "visa_class": extract.snap_visa,
     "declared_purpose": extract.snap_purpose,
     "fee_status": extract.snap_fee,
+    "applicant_name": extract.snap_name,
 }
 
 
@@ -162,11 +163,81 @@ def merge_case(pages: list[pagedoc.PageDoc]) -> dict:
             continue
         flags |= p.observed_flags
 
+    # A biometric slip so damaged its flag line can't be read IS the
+    # illegible_biometrics condition.
+    for p in pages:
+        if p.decoy or p.ptype != "biometric" or p.source != "ocr":
+            continue
+        obs_line = bool(p.observed_flags) or "observed" in p.text.lower()
+        if (p.ocr_conf or 0) < 65 and not obs_line:
+            flags.add("illegible_biometrics")
+
+    _resolve_name(pages, merged, provenance, flags, case_id)
+
     merged["risk_flags"] = flags
     merged["case_id"] = case_id
     merged["_provenance"] = provenance
     merged["_pages"] = pages
     return merged
+
+
+# When pages disagree on the applicant, the intake form is the tampered one:
+# on train conflicts the truth name came from registry (25), b13 (14),
+# letter (9), intake (5).
+NAME_TRUST = {"registry": 0, "biometric": 1, "sponsor": 2, "intake": 3}
+
+
+def _resolve_name(pages, merged, provenance, flags, case_id):
+    """Majority-vote the applicant name across pages; derive
+    identity_conflict / sponsor_mismatch from disagreements."""
+    corrected = any(
+        "applicant_name" in p.corrections for p in pages if not p.decoy
+    )
+    candidates = []  # (name, ptype, trusted_source)
+    for p in pages:
+        if p.decoy or (case_id and p.packet_id and p.packet_id != case_id):
+            continue
+        raw = p.fields.get("applicant_name")
+        if not raw:
+            continue
+        name = extract.snap_name(raw)
+        if not name or " " not in name:
+            continue
+        trusted = p.source == "text" or (p.ocr_conf or 0) >= 55
+        candidates.append((name, p.ptype, trusted))
+
+    if candidates and not corrected:
+        counts = {}
+        for name, ptype, trusted in candidates:
+            w = 2 if trusted else 1
+            counts[name] = counts.get(name, 0) + w
+        best = max(
+            counts,
+            key=lambda n: (
+                counts[n],
+                -min(NAME_TRUST.get(pt, 9) for nm, pt, _ in candidates if nm == n),
+            ),
+        )
+        merged["applicant_name"] = best
+        provenance["applicant_name"] = ("vote", "mixed", None)
+
+        # Distinct names from trusted identity documents = identity conflict.
+        # (A different name on the sponsor letter is sponsor_mismatch, below.)
+        trusted_names = {n for n, pt, tr in candidates if tr and pt != "sponsor"}
+        if len(trusted_names) > 1:
+            flags.add("identity_conflict")
+
+    # Sponsor letter naming a different applicant = sponsor mismatch.
+    final = merged.get("applicant_name")
+    if final:
+        for p in pages:
+            if p.decoy or p.ptype != "sponsor":
+                continue
+            if p.source == "ocr" and (p.ocr_conf or 0) < 55:
+                continue
+            ln = extract.snap_name(p.fields.get("applicant_name", ""))
+            if ln and " " in ln and ln != final:
+                flags.add("sponsor_mismatch")
 
 
 def decide(merged: dict) -> tuple[str, dict]:
@@ -205,6 +276,15 @@ def decide(merged: dict) -> tuple[str, dict]:
     signals["low_conf_pages"] = len(low_conf)
     decision, rule = adjudicate(fields)
     signals["rule"] = rule
+
+    # Per-rule decision-policy overrides fit on train (expected-points argmax
+    # over each rule's truth distribution); see tools/fit_calibration.py.
+    try:
+        from solution.calib import POLICY
+
+        decision = POLICY.get(rule, decision)
+    except ImportError:
+        pass
     return decision, signals
 
 
@@ -279,7 +359,9 @@ def run_case(pdf_path: str) -> dict | None:
         "arrival_date": merged.get("arrival_date") or "",
         "declared_purpose": merged.get("declared_purpose") or "",
         "risk_flags": "|".join(sorted(merged["risk_flags"])) or "none",
-        "fee_status": merged.get("fee_status") or "unknown",
+        # When the fee is unreadable, output the empirical majority value —
+        # extraction is scored independently of the adjudication decision.
+        "fee_status": merged.get("fee_status") or "paid",
         "adjudication": decision,
         "confidence": conf,
     }

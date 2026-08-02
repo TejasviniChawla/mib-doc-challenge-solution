@@ -93,6 +93,31 @@ def snap_fee(value: str) -> str | None:
     return None
 
 
+def snap_name(value: str) -> str | None:
+    """Normalize an applicant name onto the closed two-token vocabulary.
+
+    Returns None for cut-out markers; falls back to the raw first two
+    alpha tokens when snapping fails.
+    """
+    if not value:
+        return None
+    if fuzz.partial_ratio("CUT OUT", value.upper()) >= 80:
+        return None
+    toks = [t for t in re.split(r"[^A-Za-z]+", value) if len(t) >= 3]
+    snapped = []
+    for t in toks:
+        r = process.extractOne(t.capitalize(), vocab.NAME_TOKENS, scorer=fuzz.ratio)
+        if r and r[1] >= 70:
+            snapped.append(r[0])
+        elif len(snapped) < 2:
+            snapped.append(t)
+        if len(snapped) == 2:
+            break
+    if not snapped:
+        return None
+    return " ".join(snapped[:2])
+
+
 def snap_flag(value: str) -> str | None:
     v = value.lower().strip().replace(" ", "_").strip("_")
     if len(v) < 5:
