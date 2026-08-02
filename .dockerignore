@@ -1,0 +1,6 @@
+.venv
+__pycache__
+.git
+*.pyc
+tools
+MEMO.md
