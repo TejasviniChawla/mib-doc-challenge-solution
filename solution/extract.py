@@ -26,11 +26,11 @@ def find_sponsor_ids(text: str) -> list[str]:
 
 
 def _fix_id_digits(text: str) -> str:
-    # Only repair characters that appear inside ID-like tokens.
+    # Only repair the digit portion of ID-like tokens, never the prefix.
     def repair(m: re.Match) -> str:
-        return m.group(0).translate(_DIGIT_FIX)
+        return m.group(1) + m.group(2).translate(_DIGIT_FIX)
 
-    return re.sub(r"(?:MIB|SPN)[-–—:\s]{0,2}[0-9OoIlSBZG]{4,6}", repair, text)
+    return re.sub(r"((?:MIB|SPN)[-–—:\s]{0,2})([0-9OoIlSBZG]{4,6})", repair, text)
 
 
 def normalize_date(text: str) -> str | None:
@@ -74,8 +74,32 @@ def snap_visa(value: str) -> str | None:
 
 
 def snap_fee(value: str) -> str | None:
-    return snap(value.lower(), vocab.FEE_STATUSES, min_score=75)
+    v = value.lower().strip()
+    if not v:
+        return None
+    # OCR often truncates these short words; first letters are distinctive
+    # (paid/pac/pai, waived/waivec, unpaid/unpaic, unknown).
+    result = process.extractOne(v, vocab.FEE_STATUSES, scorer=fuzz.WRatio)
+    if result and result[1] >= 70:
+        return result[0]
+    if v.startswith("pa"):
+        return "paid"
+    if v.startswith("wa"):
+        return "waived"
+    if v.startswith("unp"):
+        return "unpaid"
+    if v.startswith("unk"):
+        return "unknown"
+    return None
 
 
 def snap_flag(value: str) -> str | None:
-    return snap(value.lower().replace(" ", "_"), vocab.ALL_RISK_FLAGS, min_score=80)
+    v = value.lower().strip().replace(" ", "_").strip("_")
+    if len(v) < 5:
+        return None
+    # Flags appear in labeled contexts only, so a lower threshold is safe;
+    # heavy OCR damage ("bichmzsrd_yed" -> biohazard_red) needs it.
+    result = process.extractOne(v, vocab.ALL_RISK_FLAGS, scorer=fuzz.ratio)
+    if result and result[1] >= 62:
+        return result[0]
+    return None
